@@ -1,4 +1,4 @@
-use bson::Document;
+use mongodb::bson::Document;
 use mongodb::options::{CountOptions, EstimatedDocumentCountOptions, FindOptions};
 
 const DEFAULT_LIMIT: i64 = 25;
