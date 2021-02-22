@@ -27,6 +27,12 @@ impl From<base64::DecodeError> for CursorError {
     }
 }
 
+impl From<mongodb::error::Error> for CursorError {
+    fn from(err: mongodb::error::Error) -> CursorError {
+        CursorError::InvalidCursor(err.to_string())
+    }
+}
+
 impl fmt::Display for CursorError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match *self {

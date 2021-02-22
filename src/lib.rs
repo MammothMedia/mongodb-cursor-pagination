@@ -14,7 +14,9 @@ use log::warn;
 use mongodb::{options::FindOptions, Collection};
 use options::CursorOptions;
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 use std::io::Cursor;
+use futures::stream::StreamExt;
 
 /// Provides details about if there are more pages and the cursor to the start of the list and end
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -26,7 +28,7 @@ pub struct PageInfo {
 }
 
 #[cfg(feature = "graphql")]
-#[juniper::object]
+#[juniper::graphql_object]
 impl PageInfo {
     fn has_next_page(&self) -> bool {
         self.has_next_page
@@ -52,7 +54,7 @@ pub struct Edge {
 }
 
 #[cfg(feature = "graphql")]
-#[juniper::object]
+#[juniper::graphql_object]
 impl Edge {
     fn cursor(&self) -> String {
         self.cursor.to_owned()
@@ -124,20 +126,22 @@ impl<'a> PaginatedCursor {
     }
 
     /// Estimates the number of documents in the collection using collection metadata.
-    pub fn estimated_document_count(&self, collection: &Collection) -> Result<i64, CursorError> {
+    pub async fn estimated_document_count(&self, collection: &Collection) -> Result<i64, mongodb::error::Error> {
         let count_options = self.options.clone();
-        let total_count: i64 = collection.estimated_document_count(count_options).unwrap();
-        Ok(total_count)
+        match collection.estimated_document_count(count_options).await {
+            Ok(total_count) => Ok(total_count),
+            Err(e) => Err(e)
+        }
     }
 
     /// Gets the number of documents matching filter.
     /// Note that using [`PaginatedCursor::estimated_document_count`](#method.estimated_document_count)
     /// is recommended instead of this method is most cases.
-    pub fn count_documents(
+    pub async fn count_documents(
         &self,
         collection: &Collection,
         query: Option<&Document>,
-    ) -> Result<i64, CursorError> {
+    ) -> Result<i64, mongodb::error::Error> {
         let mut count_options = self.options.clone();
         count_options.limit = None;
         count_options.skip = None;
@@ -146,23 +150,26 @@ impl<'a> PaginatedCursor {
         } else {
             Document::new()
         };
-        let total_count: i64 = collection
-            .count_documents(count_query, count_options)
-            .unwrap();
-        Ok(total_count)
+        match collection.count_documents(count_query, count_options).await {
+            Ok(total_count) => Ok(total_count),
+            Err(e) => Err(e)
+        }
     }
 
     /// Finds the documents in the `collection` matching `filter`.
-    pub fn find<T>(
+    pub async fn find<T>(
         &self,
         collection: &Collection,
         filter: Option<&Document>,
     ) -> Result<FindResult<T>, CursorError>
     where
-        T: Deserialize<'a>,
+        T: DeserializeOwned,
     {
         // first count the docs
-        let total_count: i64 = self.count_documents(collection, filter).unwrap();
+        let total_count: i64 = match self.count_documents(collection, filter).await {
+            Ok(r) => r,
+            Err(e) => -1,
+        };
 
         // setup defaults
         let mut items: Vec<T> = vec![];
@@ -194,11 +201,11 @@ impl<'a> PaginatedCursor {
                     for key in keys {
                         let bson_value = sort.get(key).unwrap();
                         match bson_value {
-                            Bson::I32(value) => {
-                                new_sort.insert(key, Bson::I32(-value));
+                            Bson::Int32(value) => {
+                                new_sort.insert(key, Bson::Int32(-value));
                             }
-                            Bson::I64(value) => {
-                                new_sort.insert(key, Bson::I64(-value));
+                            Bson::Int64(value) => {
+                                new_sort.insert(key, Bson::Int64(-value));
                             }
                             _ => {}
                         };
@@ -206,11 +213,16 @@ impl<'a> PaginatedCursor {
                     options.sort = Some(new_sort);
                 }
             }
-            let cursor = collection.find(query_doc, options).unwrap();
-            for result in cursor {
+
+            let results: Vec<Result<Document, mongodb::error::Error>> = match collection.find(query_doc, options).await {
+                Ok(cursor) => cursor.collect().await,
+                Err(e) => return Err(CursorError::from(e)),
+            };
+
+            for result in results {
                 match result {
                     Ok(doc) => {
-                        let item = bson::from_bson(bson::Bson::Document(doc.clone())).unwrap();
+                        let item = bson::de::from_bson::<T>(bson::Bson::Document(doc.clone())).unwrap();
                         edges.push(Edge {
                             cursor: self.create_from_doc(&doc),
                         });
@@ -269,6 +281,123 @@ impl<'a> PaginatedCursor {
         })
     }
 
+    /// Aggregates the documents in the `collection` matching `pipeline`.
+    // pub fn aggregate<T>(
+    //     &self,
+    //     collection: &Collection,
+    //     pipeline: Option<Vec<Document>>,
+    // ) -> Result<AggregateResult<T>, CursorError>
+    // where
+    //     T: Deserialize<'a>,
+    // {
+    //     // first count the docs
+    //     let total_count: i64 = self.count_documents(collection, pipeline).unwrap();
+
+    //     // setup defaults
+    //     let mut items: Vec<T> = vec![];
+    //     let mut edges: Vec<Edge> = vec![];
+    //     let mut has_next_page = false;
+    //     let mut has_previous_page = false;
+    //     let mut has_skip = false;
+    //     let mut start_cursor: Option<String> = None;
+    //     let mut next_cursor: Option<String> = None;
+
+    //     // make the query if we have some docs
+    //     if total_count > 0 {
+    //         // build the cursor
+
+    //         let mut options = self.options.clone();
+    //         let skip_value: i64 = if let Some(s) = options.skip { s } else { 0 };
+    //         if self.has_cursor || skip_value == 0 {
+    //             options.skip = None;
+    //         } else {
+    //             has_skip = true;
+    //         }
+    //         // let has_previous
+    //         let is_previous_query = self.has_cursor && self.direction == CursorDirections::Previous;
+    //         // if it's a previous query we need to reverse the sort we were doing
+    //         if is_previous_query {
+    //             if let Some(sort) = options.sort {
+    //                 let keys: Vec<&String> = sort.keys().collect();
+    //                 let mut new_sort = Document::new();
+    //                 for key in keys {
+    //                     let bson_value = sort.get(key).unwrap();
+    //                     match bson_value {
+    //                         Bson::I32(value) => {
+    //                             new_sort.insert(key, Bson::I32(-value));
+    //                         }
+    //                         Bson::I64(value) => {
+    //                             new_sort.insert(key, Bson::I64(-value));
+    //                         }
+    //                         _ => {}
+    //                     };
+    //                 }
+    //                 options.sort = Some(new_sort);
+    //             }
+    //         }
+    //         let cursor = collection.aggregate(pipeline, options).unwrap();
+    //         for result in cursor {
+    //             match result {
+    //                 Ok(doc) => {
+    //                     let item = bson::from_bson(bson::Bson::Document(doc.clone())).unwrap();
+    //                     edges.push(Edge {
+    //                         cursor: self.create_from_doc(&doc),
+    //                     });
+    //                     items.push(item);
+    //                 }
+    //                 Err(error) => {
+    //                     warn!("Error to find doc: {}", error);
+    //                 }
+    //             }
+    //         }
+    //         let has_more: bool;
+    //         if has_skip {
+    //             has_more = (items.len() as i64 + skip_value) < total_count;
+    //             has_previous_page = true;
+    //             has_next_page = has_more;
+    //         } else {
+    //             has_more = items.len() > (self.options.limit.unwrap() - 1) as usize;
+    //             has_previous_page = (self.has_cursor && self.direction == CursorDirections::Next)
+    //                 || (is_previous_query && has_more);
+    //             has_next_page = (self.direction == CursorDirections::Next && has_more)
+    //                 || (is_previous_query && self.has_cursor);
+    //         }
+
+    //         // reorder if we are going backwards
+    //         if is_previous_query {
+    //             items.reverse();
+    //             edges.reverse();
+    //         }
+    //         // remove the extra item to check if we have more
+    //         if has_more && !is_previous_query {
+    //             items.pop();
+    //             edges.pop();
+    //         } else if has_more {
+    //             items.remove(0);
+    //             edges.remove(0);
+    //         }
+
+    //         // create the next cursor
+    //         if !items.is_empty() && edges.len() == items.len() {
+    //             start_cursor = Some(edges[0].cursor.to_owned());
+    //             next_cursor = Some(edges[items.len() - 1].cursor.to_owned());
+    //         }
+    //     }
+
+    //     let page_info = PageInfo {
+    //         has_next_page,
+    //         has_previous_page,
+    //         start_cursor,
+    //         next_cursor,
+    //     };
+    //     Ok(AggregateResult {
+    //         page_info,
+    //         total_count,
+    //         edges,
+    //         items,
+    //     })
+    // }
+
     fn get_value_from_doc(&self, key: &str, doc: Bson) -> Option<(String, Bson)> {
         let parts: Vec<&str> = key.splitn(2, ".").collect();
         match doc {
@@ -298,22 +427,13 @@ impl<'a> PaginatedCursor {
                 }
             }
             let mut buf = Vec::new();
-            bson::encode_document(&mut buf, &only_sort_keys).unwrap();
+            only_sort_keys.to_writer(&mut buf).unwrap();
             base64::encode(&buf)
         } else {
             "".to_owned()
         }
     }
 
-    /*
-    $or: [{
-        launchDate: { $lt: nextLaunchDate }
-    }, {
-        // If the launchDate is an exact match, we need a tiebreaker, so we use the _id field from the cursor.
-        launchDate: nextLaunchDate,
-    _id: { $lt: nextId }
-    }]
-    */
     fn get_query(&self, query: Option<&Document>) -> Result<Document, CursorError> {
         // now create the filter
         let mut query_doc = match query {
@@ -385,7 +505,7 @@ fn map_from_base64(base64_string: String) -> Result<Document, CursorError> {
     // change from base64
     let decoded = base64::decode(&base64_string)?;
     // decode from bson
-    let cursor_doc = bson::decode_document(&mut Cursor::new(&decoded)).unwrap();
+    let cursor_doc = Document::from_reader(&mut Cursor::new(&decoded)).unwrap();
     Ok(cursor_doc)
 }
 
